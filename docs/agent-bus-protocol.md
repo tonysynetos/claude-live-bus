@@ -1,6 +1,6 @@
 # Agent-Bus Protocol (live-bus for parallel subagents)
 
-Extends the 2-session live-bus (`/pair`, `/bus`, `live-bus-read.ps1`) to parallel subagents.
+Extends the paired-session live-bus (`/pair`, `/bus`, and the reader/commit hooks) to parallel subagents.
 **Write-only for agents; only the coordinator reads.**
 
 ## Why not a full symmetric bus for agents
@@ -34,7 +34,7 @@ Extends the 2-session live-bus (`/pair`, `/bus`, `live-bus-read.ps1`) to paralle
 ## Semantics (same as the session bus)
 - One writer per file; append-only JSONL; ms epoch timestamps (UTC).
 - `scratch` = provisional, verify before building on it; `promoted` = verified.
-- Delivery to a *paired human session* is at-most-once notification; the files are the durable truth.
+- Delivery to a *paired human session* is at-least-once: updates are committed only after a completed turn, so a cancelled turn can replay them. The JSONL files remain the durable truth.
 - Claims have no TTL — the coordinator clears stale claims from dead agents.
 
 ## When to use

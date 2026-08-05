@@ -1,112 +1,145 @@
 # claude-live-bus
 
-**Shared memory between concurrent Claude Code sessions — "same brain, two hands."**
+Shared working memory for two concurrent Claude Code sessions: same brain, two hands.
 
-Two (or more) Claude Code sessions working on the same task can share findings and coordinate
-who-does-what, live, at turn boundaries — with **zero cost to normal solo sessions**. Pure
-PowerShell + JSONL files. No server, no database, no MCP, no dependencies.
-
-```
-Session A                                Session B
-   │  /pair owner-reconcile                 │  /pair owner-reconcile
-   │  /bus claim lane:invoices ...          │
-   │                                        │  (next turn) LIVE-BUS: A claimed [invoices]
-   │                                        │  /bus finding "bank export is missing June"
-   │  (next turn) LIVE-BUS: B found ...     │
-```
+Live-bus keeps coordination outside either repository. Paired sessions can claim lanes, release them when finished, and share evidence-backed findings without the user relaying messages. It is deliberately a small local mechanism: PowerShell, JSONL files, and a tiny Node gate; no server, database, MCP, or external dependency.
 
 ## How it works
 
-- **`session-id-inject.ps1`** (SessionStart hook) — tells each session its own real `session_id`.
-  Without this, the model has no reliable way to know its own id and pairing fails silently.
-- **`/pair <task-id>`** — attaches a session to a task: writes a reverse-pointer
-  `~/.claude/live-bus/_sessions/<sid>` → task, creates `~/.claude/live-bus/<task>/`.
-- **`/bus <claim|finding|done|note> [lane:<name>] <text>`** — appends one JSON line to that
-  session's **own** bus file (`bus.<sid>.jsonl`). One writer per file — no locking needed.
-- **`live-bus-read.ps1`** (UserPromptSubmit hook) — on every prompt: if this session is paired,
-  it surfaces every line from **other** sessions' bus files newer than a per-session watermark,
-  then advances the watermark. If not paired, it exits instantly (one `Test-Path`).
-- **`/unpair [--purge]`** — detaches; `--purge` deletes the task dir when everyone's done.
+- session-id-inject.ps1 is a SessionStart hook. It gives each session its real session_id, so pairing cannot silently write to an orphaned bus file.
+- /pair <task-id> attaches a session to a shared task and establishes the standing claim / done / finding protocol.
+- live-bus-post.ps1 is the validated writer used by /bus and by the autonomous protocol. It rejects unpaired sessions, invalid kinds, empty or overlong text, and unsupported promotions.
+- live-bus-read.ps1 reads peer updates at UserPromptSubmit. It records a pending watermark only.
+- live-bus-commit.ps1 runs at Stop and promotes the pending watermark after the turn completes. A cancelled turn therefore replays its updates instead of losing them.
+- live-bus-peek.mjs is the PreToolUse gate. It runs cheaply on every tool call and launches the PowerShell reader only when a peer has a newer file, enabling mid-turn delivery.
+- /unpair detaches a session; use /unpair --purge only when all collaborators are done.
 
-### Design decisions (the why)
+Each session appends only to its own bus.<session-id>.jsonl file. This avoids concurrent writes to a shared JSONL file, so no locking is needed.
 
-| Decision | Why |
-|---|---|
-| Turn-boundary delivery, not real-time | UserPromptSubmit is the only injection point the harness gives you. Accept the ceiling. |
-| One writer per file (`bus.<sid>.jsonl`) | Concurrent appends to a shared file on Windows are a corruption lottery. Per-writer files need no locks. |
-| Per-session watermark files | Each reader tracks what it has seen; readers never mutate writers' files. |
-| `scratch` vs `promoted` tiers | An unverified finding surfaced as fact poisons the other session. Provisional-by-default keeps the shared-truth guarantee honest. |
-| At-most-once delivery | The watermark advances at read time; a canceled prompt can drop an injection. The JSONL files remain the durable truth — no ack machinery. |
-| Size caps (20 lines / 300 chars) | A chatty peer must not blow up the other session's context window. Overflow points at the files. |
-| Ephemeral per-task dirs | The bus is working memory, not an archive. Purge on `/unpair --purge`. |
-| Memory shared, code isolated | Pair the *knowledge*; keep working trees separate (git worktrees) so the hands never fight over files. |
+## v2 guarantees
 
-### Known limitations (accepted, documented)
+| Mechanism | Result |
+| --- | --- |
+| Pending then committed watermark | At-least-once delivery: a cancelled turn can replay an update, but does not silently lose it. |
+| Claim replay plus heartbeat | Open lanes remain visible until a matching done or leave; silent owners are marked STALE after 15 minutes, never auto-released. |
+| Priority eviction | At most 20 updates are injected at once; claim and done entries are retained ahead of chatter. |
+| Evidence-gated promotion | A promoted finding must carry an evidence receipt (commit, file:line, or command), otherwise the reader treats it as provisional. |
+| Node PreToolUse gate | Solo and idle sessions avoid the expensive PowerShell reader on every tool call. |
 
-- **Not real-time:** the other hand sees your line at its *next turn*, not immediately.
-- **At-most-once:** see above. Rare; files re-readable manually.
-- **No claim TTL:** a crashed session's `claim` stands until cleared by hand or purge.
-- **Millisecond-tie edge:** a line with `ts` exactly equal to the watermark written *after* the
-  previous read is skipped. Negligible in practice.
-- **PowerShell spawn floor:** every hook invocation pays ~100–200 ms process spawn (Windows).
-  The unpaired path adds nothing measurable beyond that.
+This is coordination memory, not a code-sharing mechanism. When two sessions change the same repository, give them separate git worktrees.
 
-## Parallel subagents
+## Requirements
 
-The same bus extends to fan-outs of parallel subagents — but **write-only**: agents append
-claims/findings via a one-line template in their dispatch prompt; only the coordinator reads,
-between waves. Rationale and dispatch template: [docs/agent-bus-protocol.md](docs/agent-bus-protocol.md).
+- Windows
+- Claude Code
+- PowerShell 5.1+ (PowerShell 7 also works)
+- Node.js for the optional-but-recommended mid-turn PreToolUse gate
 
 ## Install
 
-Requirements: Windows, Claude Code, PowerShell 5.1+ (works on 7+ too).
+1. Copy the files in hooks\ to %USERPROFILE%\.claude\hooks\ and commands\ to %USERPROFILE%\.claude\commands\.
+2. Merge the following entries into the corresponding arrays in %USERPROFILE%\.claude\settings.json. Do not replace unrelated hook entries.
+3. Adjust the node.exe path if Node is installed elsewhere.
+4. Restart Claude Code sessions so SessionStart can inject each session id.
 
-1. Copy `hooks/*.ps1` to `%USERPROFILE%\.claude\hooks\`.
-2. Copy `commands/*.md` to `%USERPROFILE%\.claude\commands\` (adds `/pair`, `/bus`, `/unpair`).
-3. Register both hooks in `%USERPROFILE%\.claude\settings.json`:
-
-```json
+~~~json
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command",
-          "command": "powershell -NoProfile -File \"C:/Users/<you>/.claude/hooks/session-id-inject.ps1\"" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -File \"C:/Users/<you>/.claude/hooks/session-id-inject.ps1\""
+          }
+        ]
+      }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command",
-          "command": "powershell -NoProfile -File \"C:/Users/<you>/.claude/hooks/live-bus-read.ps1\"" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -File \"C:/Users/<you>/.claude/hooks/live-bus-read.ps1\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/nodejs/node.exe\" \"C:/Users/<you>/.claude/hooks/live-bus-peek.mjs\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -File \"C:/Users/<you>/.claude/hooks/live-bus-commit.ps1\""
+          }
+        ]
+      }
     ]
   }
 }
-```
+~~~
 
-4. Restart your sessions (the SessionStart hook must run once so each session knows its id).
+If the Node gate is unavailable, the UserPromptSubmit and Stop hooks still provide turn-boundary coordination; the gate supplies the v2 mid-turn path.
 
-macOS/Linux: the design ports directly (bash + jq instead of PowerShell); PRs welcome.
+## Use
+
+In each session:
+
+~~~text
+/pair <shared-task-id>
+~~~
+
+Before a distinct unit of work, claim it. Post done the moment it is completed or abandoned. Post a finding only when it changes what the other session should do. Use evidence only for a fact you actually checked.
+
+~~~powershell
+powershell -NoProfile -File "$env:USERPROFILE\.claude\hooks\live-bus-post.ps1" -Sid "<real-session-id>" -Kind claim -Lane "api-route" -Text "updating the API route"
+powershell -NoProfile -File "$env:USERPROFILE\.claude\hooks\live-bus-post.ps1" -Sid "<real-session-id>" -Kind done -Lane "api-route" -Text "API route complete" -Evidence "src/routes.ts:42"
+~~~
+
+Do not post progress narration or acknowledgements of another session's message. The bus is a coordination channel, not a chat.
 
 ## Test
 
-A self-contained 16-test harness runs the real hook as a subprocess against sandboxed synthetic
-sessions — it never touches your repos or real sessions:
+After installing the hooks, run the self-test from this checkout:
 
-```powershell
+~~~powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\live-bus-test.ps1
-```
+~~~
 
-Covers: unpaired fast path + latency, other-hand visibility, own-line skipping, watermark
-advance, ts ordering, malformed/torn JSONL lines, unicode through stdout, provisional/promoted
-labeling, lanes, 3-session fan-in, corrupt-watermark degradation (replays instead of losing),
-empty peer files, per-line truncation, flood capping.
+It creates and removes only a _selftest task under %USERPROFILE%\.claude\live-bus\. The test covers pending/committed delivery, tool-mode delivery, priority eviction, evidence enforcement, open-lane handling, the Node gate, the writer, and the reader footer.
+
+## Parallel subagents
+
+The same file format can support a write-only progress bus for parallel subagents. Only the coordinator reads it; agents still return their normal structured result. See docs/agent-bus-protocol.md.
 
 ## File format
 
-`~/.claude/live-bus/<task>/bus.<session-id>.jsonl`, one JSON object per line:
+Each line in %USERPROFILE%\.claude\live-bus\<task>\bus.<session-id>.jsonl is one JSON object:
 
-```json
-{"session":"<sid>","ts":1784196342392,"kind":"claim|finding|done|note|join|leave","text":"...","tier":"scratch|promoted","lane":"optional-lane-name"}
-```
+~~~json
+{
+  "session": "<sid>",
+  "ts": 1784196342392,
+  "kind": "claim|finding|done|note|join|leave",
+  "text": "short one-line update",
+  "tier": "scratch|promoted",
+  "lane": "optional-lane-name",
+  "evidence": "optional verification receipt"
+}
+~~~
 
-`ts` is UTC epoch milliseconds. Never put secrets or sensitive data on the bus — it's a plaintext log.
+Never put credentials, guest data, financial data, or other sensitive information on the bus: it is plaintext local working memory.
 
 ## License
 
